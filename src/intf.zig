@@ -1,4 +1,4 @@
-const pam = @import("../exports.zig");
+const pam = @import("main.zig");
 const c = @cImport({
     @cInclude("security/pam_modules.h");
 });

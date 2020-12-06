@@ -1,7 +1,10 @@
 const std = @import("std");
-const c = @cImport({
+pub const c = @cImport({
+    @cInclude("security/pam_appl.h");
     @cInclude("security/pam_modules.h");
 });
+
+const mem = std.mem;
 
 const MessageStyle = enum(c_int) {
     prompt_echo_off,
@@ -11,47 +14,81 @@ const MessageStyle = enum(c_int) {
     _,
 };
 
-const Message = extern struct {
+pub const Message = extern struct {
     style: MessageStyle,
     msg: [*:0]const u8,
 };
 
-const Response = extern struct {
+pub const Response = extern struct {
     resp: [*:0]const u8,
     ret_code: c_int,
 };
 
-pub fn conversation(comptime func: fn (*Allocator, []*const Message, usize) Error![]Response, appdata_ptr: usize) c.pam_conv {
+pub const Conv = extern struct {
+    conv: fn (
+        num_msg: c_int,
+        msg: [*c][*c]const c.pam_message,
+        resp: [*c][*c]c.pam_response,
+        data_ptr: ?*c_void,
+    ) callconv(.C) c_int,
+    appdata_ptr: usize,
+};
+
+pub fn conversation(
+    comptime func: fn (
+        *mem.Allocator,
+        []*const Message,
+        []Response,
+        usize,
+    ) Error!void,
+    appdata_ptr: usize,
+) Conv {
     const Glue = struct {
-        pub fn conv(num_msg: c_int, msg: *[*]const c.pam_message, resp: **c.pam_response, appdata_ptr: usize) callconv(.C) c_int {
+        fn handle(
+            num_msg: c_int,
+            msg: [*]*const c.pam_message,
+            resp: *?*c.pam_response,
+            data_ptr: usize,
+        ) Error!void {
+            const num = @intCast(usize, num_msg);
             const allocator = std.heap.c_allocator;
-            return blk: {
-                const ret = cleanup: {
-                    const response = func(allocator, msg.*[0..num_msg], appdata_ptr) catch |err| {
-                        break :cleanup errToInt(err);
-                    };
+            errdefer {
+                var i: usize = 0;
+                while (i < num) : (i += 1) allocator.destroy(msg[i]);
+            }
 
-                    if (response.len != num_msg) {
-                        allocator.free(response);
-                        // TODO: is this the error we want to return?
-                        break :cleanup errToInt(error.Abort);
-                    }
-
-                    break :blk 0;
-                };
-
-                var i: c_int = 0;
-                while (i < num_msg) : (i += 1) {
-                    allocator.destroy(msg.*[i]);
-                }
-
-                break :blk ret;
+            const responses = allocator.alloc(Response, num) catch |err| {
+                return error.System;
             };
+            errdefer allocator.free(responses);
+
+            try func(
+                allocator,
+                @bitCast([]*const Message, msg[0..num]),
+                responses,
+                data_ptr,
+            );
+            resp.* = @ptrCast(*c.pam_response, responses.ptr);
+        }
+
+        pub fn conv(
+            num_msg: c_int,
+            msg: [*c][*c]const c.pam_message,
+            resp: [*c][*c]c.pam_response,
+            data_ptr: ?*c_void,
+        ) callconv(.C) c_int {
+            handle(
+                num_msg,
+                @ptrCast([*]*const c.pam_message, msg),
+                resp,
+                @ptrToInt(data_ptr),
+            ) catch |err| return errToInt(err);
+            return 0;
         }
     };
 
-    return c.pam_conv{
-        .func = Glue.conv,
+    return Conv{
+        .conv = Glue.conv,
         .appdata_ptr = appdata_ptr,
     };
 }
@@ -90,7 +127,7 @@ pub const ItemType = enum(c_int) {
     }
 };
 
-const Error = error{
+pub const Error = error{
     Abort,
     AcctExpired,
     Auth,
@@ -108,7 +145,7 @@ const Error = error{
     CredInsufficient,
     CredUnavail,
     MaxTries,
-    NewAuthtokReqd,
+    NewAuthTokReqd,
     PermDenied,
     System,
     TryAgain,
@@ -134,11 +171,11 @@ pub fn errToInt(pam_error: Error) c_int {
         error.CredInsufficient => c.PAM_CRED_INSUFFICIENT,
         error.CredUnavail => c.PAM_CRED_UNAVAIL,
         error.MaxTries => c.PAM_MAXTRIES,
-        error.NewAuthtokReqd => c.PAM_NEW_AUTHTOK_REQD,
+        error.NewAuthTokReqd => c.PAM_NEW_AUTHTOK_REQD,
         error.PermDenied => c.PAM_PERM_DENIED,
         error.System => c.PAM_SYSTEM_ERR,
         error.TryAgain => c.PAM_TRY_AGAIN,
-        error.UserUnknown => c.PAM_USER_UNKOWN,
+        error.UserUnknown => c.PAM_USER_UNKNOWN,
         else => unreachable,
     };
 }
@@ -193,7 +230,7 @@ pub fn getItem(handle: *c.pam_handle_t, comptime item_type: ItemType) !?*const I
 pub fn getUser(handle: *c.pam_handle_t, prompt: ?[:0]const u8) ![]const u8 {
     var ret: [*:0]const u8 = undefined;
     return switch (c.pam_get_user(handle, &ret, if (prompt) |str| str.ptr else null)) {
-        c.PAM_SUCCESS => std.mem.spanZ(ret),
+        c.PAM_SUCCESS => mem.spanZ(ret),
         c.PAM_SYSTEM_ERR => error.System,
         c.PAM_CONV_ERR => error.Conv,
         c.PAM_BUF_ERR => error.Buf,
@@ -216,7 +253,7 @@ pub fn putenv(handle: *c.pam_handle_t, name_value: [:0]const u8) !void {
 
 pub fn getenv(handle: *c.pam_handle_t, name: [:0]const u8) ?[]const u8 {
     return if (c.pam_getenv(handle, name.ptr)) |ret|
-        std.mem.spanZ(ret)
+        mem.spanZ(ret)
     else
         null;
 }
@@ -228,7 +265,7 @@ pub fn getenvlist(handle: *c.pam_handle_t) ?[*:null]?[*:0]u8 {
 }
 
 pub fn strerror(handle: *c.pam_handle_t, errnum: c_int) []const u8 {
-    return std.mem.spanZ(c.pam_strerror(handle, errnum));
+    return mem.spanZ(c.pam_strerror(handle, errnum));
 }
 
 pub fn failDelay(handle: *c.pam_handle_t, usec: u32) !void {
@@ -242,10 +279,10 @@ pub fn failDelay(handle: *c.pam_handle_t, usec: u32) !void {
 pub fn start(
     service_name: [:0]const u8,
     user: [:0]const u8,
-    conv: *const c.pam_conv,
+    conv: *const Conv,
 ) !*c.pam_handle_t {
     var ret: ?*c.pam_handle_t = null;
-    return switch (c.pam_start(service_name.ptr, user.ptr, conv, &ret)) {
+    return switch (c.pam_start(service_name.ptr, user.ptr, @ptrCast(*const c.pam_conv, conv), &ret)) {
         c.PAM_SUCCESS => if (ret) |handle| handle else unreachable,
         c.PAM_ABORT => error.Abort,
         c.PAM_BUF_ERR => error.Buf,
@@ -257,7 +294,7 @@ pub fn start(
 pub fn startConfdir(
     service_name: [:0]const u8,
     user: [:0]const u8,
-    conv: *c.pam_conv,
+    conv: *const Conv,
     confdir: [:0]const u8,
 ) !*c.pam_handle_t {
     var ret: ?*c.pam_handle_t = null;
@@ -283,6 +320,7 @@ pub fn end(
 
 pub const AuthError = error{
     Auth,
+    Abort,
     CredInsufficient,
     AuthInfoUnavail,
     UserUnknown,
@@ -344,7 +382,7 @@ pub fn acctMgmt(
         c.PAM_SUCCESS => {},
         c.PAM_ACCT_EXPIRED => error.AcctExpired,
         c.PAM_AUTH_ERR => error.Auth,
-        c.PAM_NEW_AUTHTOK_REQD => error.NewAuthtokReqd,
+        c.PAM_NEW_AUTHTOK_REQD => error.NewAuthTokReqd,
         c.PAM_PERM_DENIED => error.PermDenied,
         c.PAM_USER_UNKNOWN => error.UserUnknown,
         else => unreachable,
