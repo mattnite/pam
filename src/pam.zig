@@ -6,21 +6,21 @@ pub const c = @cImport({
 
 const mem = std.mem;
 
-const MessageStyle = enum(c_int) {
-    prompt_echo_off,
-    prompt_echo_on,
-    error_msg,
-    text_info,
-    _,
-};
-
 pub const Message = extern struct {
-    style: MessageStyle,
+    style: Style,
     msg: [*:0]const u8,
+
+    pub const Style = enum(c_int) {
+        prompt_echo_off = 1, //c.PAM_PROMPT_ECHO_OFF,
+        prompt_echo_on = 2, //c.PAM_PROMPT_ECHO_ON,
+        error_msg = 3, //c.PAM_ERROR_MSG,
+        text_info = 4, //c.PAM_TEXT_INFO,
+        _,
+    };
 };
 
 pub const Response = extern struct {
-    resp: [*:0]const u8,
+    resp: ?[*:0]const u8,
     ret_code: c_int,
 };
 
@@ -40,7 +40,7 @@ pub fn conversation(
         []*const Message,
         []Response,
         usize,
-    ) Error!void,
+    ) anyerror!void,
     appdata_ptr: usize,
 ) Conv {
     const Glue = struct {
@@ -52,22 +52,27 @@ pub fn conversation(
         ) Error!void {
             const num = @intCast(usize, num_msg);
             const allocator = std.heap.c_allocator;
-            errdefer {
-                var i: usize = 0;
-                while (i < num) : (i += 1) allocator.destroy(msg[i]);
-            }
-
             const responses = allocator.alloc(Response, num) catch |err| {
                 return error.System;
             };
             errdefer allocator.free(responses);
 
-            try func(
+            for (responses) |*r| r.* = Response{ .resp = null, .ret_code = 0 };
+
+            func(
                 allocator,
                 @bitCast([]*const Message, msg[0..num]),
                 responses,
                 data_ptr,
-            );
+            ) catch |err| {
+                if (err == error.OutOfMemory) return error.Buf;
+
+                // TODO: get compiler devs to fix this (can't inline this for loop)
+                for (std.meta.fields(Error)) |field| {
+                    if (std.mem.eql(u8, @errorName(err), field.name)) return @errSetCast(Error, err);
+                } else return error.System;
+            };
+
             resp.* = @ptrCast(*c.pam_response, responses.ptr);
         }
 
